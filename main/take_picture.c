@@ -65,6 +65,13 @@
 #include "esp_camera_af.h"
 #endif
 
+volatile camera_fb_t *fb;
+
+bool new_frame_ready = 0;
+bool new_frame_used = 0;
+uint8_t *frame_copy = NULL;
+size_t frame_size = 0;
+
 static int f = 0, b = 0, l = 0, r = 0;
 
 const int motion_loop_ms = 10;
@@ -378,27 +385,27 @@ static esp_err_t index_handler(httpd_req_t *req)
 
 
 
-static esp_err_t capture_handler(httpd_req_t *req)
-{
-    camera_fb_t *fb = esp_camera_fb_get();
-    if (!fb) {
-        ESP_LOGE(TAG, "Camera capture failed");
-        httpd_resp_send_500(req);
-        return ESP_FAIL;
-    }
+// static esp_err_t capture_handler(httpd_req_t *req)
+// {
+//     camera_fb_t *fb = esp_camera_fb_get();
+//     if (!fb) {
+//         ESP_LOGE(TAG, "Camera capture failed");
+//         httpd_resp_send_500(req);
+//         return ESP_FAIL;
+//     }
 
-    ESP_LOGI(TAG, "JPEG first bytes: %02X %02X %02X %02X",
-             fb->buf[0], fb->buf[1], fb->buf[2], fb->buf[3]);
+//     ESP_LOGI(TAG, "JPEG first bytes: %02X %02X %02X %02X",
+//              fb->buf[0], fb->buf[1], fb->buf[2], fb->buf[3]);
 
-    httpd_resp_set_type(req, "image/jpeg");
-    httpd_resp_set_hdr(req, "Content-Disposition", "inline; filename=capture.jpg");
+//     httpd_resp_set_type(req, "image/jpeg");
+//     httpd_resp_set_hdr(req, "Content-Disposition", "inline; filename=capture.jpg");
 
-    esp_err_t res = httpd_resp_send(req, (const char *)fb->buf, fb->len);
+//     esp_err_t res = httpd_resp_send(req, (const char *)fb->buf, fb->len);
 
-    esp_camera_fb_return(fb);
+//     esp_camera_fb_return(fb);
 
-    return res;
-}
+//     return res;
+// }
 
 static esp_err_t control_handler(httpd_req_t *req)
 {
@@ -430,21 +437,42 @@ static esp_err_t control_handler(httpd_req_t *req)
 
 static esp_err_t frame_handler(httpd_req_t *req)
 {
-    camera_fb_t *fb = esp_camera_fb_get();
-    if (!fb) {
-        ESP_LOGE(TAG, "Camera capture failed");
-        httpd_resp_send_500(req);
-        return ESP_FAIL;
-    }
+    // if (!fb) {
+    //     ESP_LOGE(TAG, "Camera capture failed");
+    //     httpd_resp_send_500(req);
+    //     return ESP_FAIL;
+    // }
+    while(!new_frame_ready); // set time limit and then send error response
+
 
     httpd_resp_set_type(req, "image/jpeg");
 
-    esp_err_t res = httpd_resp_send(req,
-        (const char *)fb->buf,
-        fb->len);
+    esp_err_t res = httpd_resp_send(req, (const char *)fb->buf, fb->len);
 
-    esp_camera_fb_return(fb);
+    new_frame_used = 1;
+
     return res;
+}
+
+void camera_task(void *pvParameters)
+{   
+    while(1){
+        while(!new_frame_ready){
+            fb = esp_camera_fb_get();
+            if (fb){
+                new_frame_ready = 1;
+            }
+        }
+        if(new_frame_used){
+            if(fb){
+                esp_camera_fb_return(fb);
+            }
+
+            new_frame_ready = 0;
+        }
+        vTaskDelay(1/portTICK_RATE_MS);
+    }
+    
 }
 
 static httpd_handle_t start_server(void)
@@ -456,19 +484,21 @@ static httpd_handle_t start_server(void)
     if (httpd_start(&server, &config) == ESP_OK)
     {
         httpd_uri_t index_uri   = { .uri="/",         .method=HTTP_GET, .handler=index_handler,   .user_ctx=NULL };
-        httpd_uri_t capture_uri = { .uri="/capture",  .method=HTTP_GET, .handler=capture_handler, .user_ctx=NULL };
+        //httpd_uri_t capture_uri = { .uri="/capture",  .method=HTTP_GET, .handler=capture_handler, .user_ctx=NULL };
         httpd_uri_t frame_uri = { .uri = "/frame", .method = HTTP_GET, .handler = frame_handler, .user_ctx = NULL };
         httpd_uri_t control_uri = { .uri = "/control", .method = HTTP_GET, .handler = control_handler, .user_ctx = NULL };
 
         httpd_register_uri_handler(server, &control_uri);
         httpd_register_uri_handler(server, &frame_uri);
         httpd_register_uri_handler(server, &index_uri);
-        httpd_register_uri_handler(server, &capture_uri);
+        //httpd_register_uri_handler(server, &capture_uri);
 
     }
 
     return server;
 }
+
+
 
 void gpio_init(void)
 {
@@ -509,6 +539,16 @@ void app_main(void)
 
     sensor_t *s = esp_camera_sensor_get();
     s->set_hmirror(s, 1);
+
+    xTaskCreate(
+        camera_task,       // Task function
+        "camera_task",     // Task name
+        8192,          // Stack size in bytes
+        NULL,          // Parameters
+        5,             // Priority
+        NULL           // Task handle
+    );
+
     vTaskDelay(5000 / portTICK_RATE_MS);
 
     ESP_LOGI(TAG, "Starting server...");
@@ -524,6 +564,7 @@ void app_main(void)
 
     
     while (true) {
+        ESP_LOGI(TAG, "%d %d %d %d", f,b,r,l);
         if(((f+b+l+r)==1)||((f+b+l+r)==2)){
             if(f && b){
                 stop();
