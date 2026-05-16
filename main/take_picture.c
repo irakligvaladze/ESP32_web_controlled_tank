@@ -40,7 +40,7 @@
 #include <nvs_flash.h>
 #include <sys/param.h>
 #include <string.h>
-
+#include "mdns.h"
 #include "esp_wifi.h"
 #include "esp_event.h"
 #include "esp_netif.h"
@@ -48,11 +48,12 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "driver/gpio.h"
+#include "driver/twai.h"
 
 #define PIN_O1 32
 #define PIN_O2 33
 #define PIN_O3 12
-#define PIN_O4 14
+#define PIN_O4 13
 
 // support IDF 5.x
 #ifndef portTICK_RATE_MS
@@ -64,6 +65,9 @@
 #if defined(CONFIG_CAMERA_AF_SUPPORT) && CONFIG_CAMERA_AF_SUPPORT
 #include "esp_camera_af.h"
 #endif
+
+char buffer_str[32];
+static httpd_handle_t server = NULL;
 
 volatile camera_fb_t *fb;
 
@@ -161,30 +165,9 @@ static void maybe_init_autofocus(void)
 #endif
 #endif
 
-static void wifi_init_sta(void)
-{
-    ESP_ERROR_CHECK(nvs_flash_init());
-    ESP_ERROR_CHECK(esp_netif_init());
-    ESP_ERROR_CHECK(esp_event_loop_create_default());
-    esp_netif_create_default_wifi_sta();
 
-    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
-    esp_wifi_init(&cfg);
 
-    wifi_config_t wifi_config = {
-        .sta = {
-            .ssid = WIFI_SSID,
-            .password = WIFI_PASS,
-        },
-    };
 
-    esp_wifi_set_mode(WIFI_MODE_STA);
-    esp_wifi_set_config(WIFI_IF_STA, &wifi_config);
-    esp_wifi_start();
-    esp_wifi_connect();
-
-    ESP_LOGI(TAG, "WiFi connecting...");
-}
 
 static esp_err_t index_handler(httpd_req_t *req)
 {
@@ -475,29 +458,84 @@ void camera_task(void *pvParameters)
     
 }
 
-static httpd_handle_t start_server(void)
+void start_webserver(void)
 {
+    if (server != NULL) return;
+
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
-    httpd_handle_t server = NULL;
+    ESP_LOGI(TAG, "Starting HTTP server...");
     
 
     if (httpd_start(&server, &config) == ESP_OK)
     {
+
         httpd_uri_t index_uri   = { .uri="/",         .method=HTTP_GET, .handler=index_handler,   .user_ctx=NULL };
-        //httpd_uri_t capture_uri = { .uri="/capture",  .method=HTTP_GET, .handler=capture_handler, .user_ctx=NULL };
         httpd_uri_t frame_uri = { .uri = "/frame", .method = HTTP_GET, .handler = frame_handler, .user_ctx = NULL };
         httpd_uri_t control_uri = { .uri = "/control", .method = HTTP_GET, .handler = control_handler, .user_ctx = NULL };
 
         httpd_register_uri_handler(server, &control_uri);
         httpd_register_uri_handler(server, &frame_uri);
         httpd_register_uri_handler(server, &index_uri);
-        //httpd_register_uri_handler(server, &capture_uri);
-
+        ESP_LOGI(TAG, "Server started");
+    } else {
+        ESP_LOGE(TAG, "Failed to start server");
     }
 
-    return server;
 }
 
+static void wifi_event_handler(void* arg, esp_event_base_t event_base,
+                               int32_t event_id, void* event_data)
+{
+    if (event_base == WIFI_EVENT) {
+        if (event_id == WIFI_EVENT_STA_START) {
+            esp_wifi_connect();
+        } else if (event_id == WIFI_EVENT_STA_DISCONNECTED) {
+            esp_wifi_connect();
+            ESP_LOGI(TAG, "WiFi disconnected. Reconnecting...");
+            
+        
+        }
+    } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
+        ip_event_got_ip_t* event = (ip_event_got_ip_t*) event_data;
+        ESP_LOGI(TAG, "Got IP:" IPSTR, IP2STR(&event->ip_info.ip));
+        sprintf(buffer_str, IPSTR, IP2STR(&event->ip_info.ip));
+        
+        ESP_ERROR_CHECK(mdns_init());
+        ESP_ERROR_CHECK(mdns_hostname_set("esp-tank"));
+        ESP_ERROR_CHECK(mdns_instance_name_set("ESP32 Tank"));
+       
+        start_webserver();
+    }
+}
+
+void wifi_init(void)
+{
+    ESP_ERROR_CHECK(nvs_flash_init());
+    ESP_ERROR_CHECK(esp_netif_init());
+    ESP_ERROR_CHECK(esp_event_loop_create_default());
+    esp_netif_t *sta_netif = esp_netif_create_default_wifi_sta();
+    ESP_ERROR_CHECK(esp_netif_set_hostname(sta_netif, "esp-tank"));
+    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+
+    ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT,
+                                                        ESP_EVENT_ANY_ID,
+                                                        &wifi_event_handler,
+                                                        NULL,
+                                                        NULL));
+    ESP_ERROR_CHECK(esp_event_handler_instance_register(IP_EVENT,
+                                                        IP_EVENT_STA_GOT_IP,
+                                                        &wifi_event_handler,
+                                                        NULL,
+                                                        NULL));
+
+    wifi_config_t wifi_config = {
+        .sta = { .ssid = WIFI_SSID, .password = WIFI_PASS },
+    };
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
+    ESP_ERROR_CHECK(esp_wifi_start());
+}
 
 
 void gpio_init(void)
@@ -529,17 +567,16 @@ void stop(void){
 void app_main(void)
 {   
     f = 0, b = 0, l = 0, r = 0;  // defaults
+
     gpio_init();
+    ESP_LOGI(TAG, "Initialized GPIO.");
+    ESP_LOGI(TAG, "Initialized OLED screen");
 
-    ESP_LOGI(TAG, "Starting WiFi...");
-    wifi_init_sta();
 
-    ESP_LOGI(TAG, "Starting camera...");
+    
     init_camera();
-
     sensor_t *s = esp_camera_sensor_get();
     s->set_hmirror(s, 1);
-
     xTaskCreate(
         camera_task,       // Task function
         "camera_task",     // Task name
@@ -548,23 +585,14 @@ void app_main(void)
         5,             // Priority
         NULL           // Task handle
     );
-
-    vTaskDelay(5000 / portTICK_RATE_MS);
-
-    ESP_LOGI(TAG, "Starting server...");
-    httpd_handle_t server = start_server();
-
-    if (server == NULL) {
-        ESP_LOGE(TAG, "HTTP server failed to start!");
-    } else {
-        ESP_LOGI(TAG, "HTTP server started OK");
-    }
+    ESP_LOGI(TAG, "Camera started");
+    wifi_init();
 
     ESP_LOGI(TAG, "Ready");
 
     
     while (true) {
-        ESP_LOGI(TAG, "%d %d %d %d", f,b,r,l);
+        //ESP_LOGI(TAG, "%d %d %d %d", f,b,r,l);
         if(((f+b+l+r)==1)||((f+b+l+r)==2)){
             if(f && b){
                 stop();
